@@ -15,6 +15,7 @@ from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
+    FSInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -22,6 +23,7 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
+from html import escape
 
 load_dotenv()
 
@@ -331,25 +333,56 @@ class FazerCards:
         if FAZER_FREE_FIRE_CATEGORY:
             return FAZER_FREE_FIRE_CATEGORY
 
-        data = await self.get("/topups", {"limit": 100})
-        for item in data.get("items", []):
-            text = f"{item.get('name','')} {item.get('category_id','')}".lower()
-            if "free fire" in text or "free_fire" in text:
-                return item.get("category_id")
+        # FazerCards uses cursor pagination for /topups. Search several pages
+        # so Free Fire is found even when it is not in the first 100 categories.
+        cursor = None
+        for _ in range(10):
+            params = {"limit": 100}
+            if cursor:
+                params["cursor"] = cursor
+            data = await self.get("/topups", params)
+            for item in data.get("items", []):
+                text = f"{item.get('name','')} {item.get('category_id','')}".lower()
+                if "free fire" in text or "free_fire" in text or "freefire" in text:
+                    return item.get("category_id")
+            meta = data.get("meta", {}) or {}
+            cursor = meta.get("next_cursor")
+            if not cursor:
+                break
         return None
 
     async def offers(self, category_id):
         return await self.get("/topups/offers", {"category_id": category_id})
 
-    async def validate_free_fire(self, player_id):
-        # Validation namespace is separate from purchasable top-up category.
-        body = {
-            "category_id": "free_fire",
-            "fields": {"player_id": player_id},
-        }
+    async def validate_free_fire(self, category_id, player_id, extra_fields=None):
+        # First discover the validation category/fields, then POST the exact
+        # field names required by FazerCards.
         try:
-            return await self.post("/topups/validate-id", body)
+            data = await self.get("/topups/validate-id")
+            items = data.get("items", [])
+            validation = next(
+                (x for x in items if x.get("category_id") == category_id),
+                None,
+            )
+            if not validation:
+                return {"valid": None}
+
+            fields = {}
+            extra_fields = extra_fields or {}
+            for field in validation.get("fields", []):
+                key = field.get("key", "")
+                kl = key.lower()
+                if kl in {"player_id", "uid", "id", "game_id"}:
+                    fields[key] = player_id
+                elif key in extra_fields:
+                    fields[key] = extra_fields[key]
+
+            return await self.post("/topups/validate-id", {
+                "category_id": category_id,
+                "fields": fields,
+            })
         except Exception:
+            logging.exception("FazerCards ID validation failed")
             return {"valid": None}
 
     async def place_order(self, category_id, offer_id, fields):
@@ -437,6 +470,7 @@ def make_receipt(order, status="accepted"):
     d.text((550, 1260), "ПАРДОХТ ТАСДИҚ ШУД", anchor="mm", font=font(36, True), fill=white)
 
     d.text((550, 1370), BOT_NAME, anchor="ma", font=font(30, True), fill=orange)
+    d.text((550, 1415), "Ташаккур барои интихоби мо!", anchor="ma", font=font(24), fill=gray)
 
     path = RECEIPT_DIR / f"receipt_{order['order_no']}.png"
     img.save(path, "PNG")
@@ -482,7 +516,9 @@ async def start(message: Message):
         return
 
     await message.answer(
-        f"🔥 <b>{BOT_NAME}</b>",
+        f"🔥 <b>{BOT_NAME}</b>\n\n"
+        "Пур кардани баланс ва хариди Free Fire — зуд ва осон.\n"
+        "🔐 Барои фармоиш танҳо UID, nickname ва region лозим мешавад.",
         reply_markup=main_menu(),
     )
 
@@ -493,13 +529,12 @@ async def check_sub(call: CallbackQuery):
         await call.message.edit_text("✅ Обуна тасдиқ шуд.", reply_markup=main_menu())
     else:
         await call.answer("❌ Аввал ба канал обуна шавед.", show_alert=True)
-    await call.answer()
 
 
 @dp.callback_query(F.data == "home")
 async def home(call: CallbackQuery, state: FSMContext):
     await state.clear()
-    await call.message.edit_text(f"🔥 <b>{BOT_NAME}</b>", reply_markup=main_menu())
+    await call.message.edit_text(f"🔥 <b>{BOT_NAME}</b>\n\nМенюи асосӣ:", reply_markup=main_menu())
     await call.answer()
 
 
@@ -595,7 +630,7 @@ async def payment_proof(message: Message, state: FSMContext):
         caption = (
             f"💳 <b>ПАРДОХТИ НАВ #{payment_id}</b>\n\n"
             f"👤 User ID: <code>{message.from_user.id}</code>\n"
-            f"👤 @{message.from_user.username or '—'}\n"
+            f"👤 @{escape(message.from_user.username or '—')}\n"
             f"💰 Маблағ: <b>{amount:.2f} сом</b>\n"
             f"🏦 Усул: <b>{method}</b>"
         )
@@ -802,6 +837,11 @@ async def order_region(message: Message, state: FSMContext):
         offers_data = await fz.offers(category_id)
         offers = offers_data.get("offers", [])
 
+        # Validate the Free Fire ID when FazerCards exposes validation for this category.
+        validation = await fz.validate_free_fire(category_id, data["player_id"], {"region": region, "nickname": data["nickname"]})
+        if validation.get("valid") is False:
+            raise RuntimeError("Free Fire UID validation failed")
+
         # Best-effort offer matching by diamond/package number/name.
         offer = match_offer(product, offers)
         if not offer:
@@ -930,7 +970,7 @@ async def my_orders(call: CallbackQuery):
         lines = ["📦 <b>Фармоишҳои охирин</b>\n"]
         for r in rows:
             lines.append(
-                f"#{r['order_no']} — {r['product_name']} — {r['price']:.2f}с — <b>{r['status']}</b>"
+                f"#{r['order_no']} — {escape(r['product_name'])} — {r['price']:.2f}с — <b>{escape(r['status'])}</b>"
             )
         text = "\n".join(lines)
 
@@ -960,11 +1000,11 @@ async def poll_provider_orders():
                         receipt = make_receipt(fresh, "accepted")
                         await bot.send_photo(
                             order["tg_id"],
-                            receipt.open("rb"),
+                            FSInputFile(str(receipt)),
                             caption=(
                                 f"✅ <b>Фармоиш #{order['order_no']} иҷро шуд!</b>\n"
-                                f"💎 {order['product_name']}\n"
-                                f"👤 {order['nickname']}\n"
+                                f"💎 {escape(order['product_name'])}\n"
+                                f"👤 {escape(order['nickname'])}\n"
                                 f"🔢 UID: <code>{order['player_id']}</code>\n"
                                 f"💰 {order['price']:.2f} сом"
                             ),
@@ -990,6 +1030,22 @@ async def poll_provider_orders():
         except Exception:
             logging.exception("Provider poll loop failed")
         await asyncio.sleep(8)
+
+
+@dp.errors()
+async def global_error_handler(event):
+    # Never let one bad update kill the bot; log the full traceback.
+    logging.exception("Unhandled update error")
+    try:
+        update = event.update
+        msg = getattr(update, "message", None)
+        cb = getattr(update, "callback_query", None)
+        target = msg or (cb.message if cb else None)
+        if target:
+            await target.answer("❌ Хатои техникӣ шуд. Лутфан дубора кӯшиш кунед.")
+    except Exception:
+        logging.exception("Could not send error message to user")
+    return True
 
 
 async def main():
