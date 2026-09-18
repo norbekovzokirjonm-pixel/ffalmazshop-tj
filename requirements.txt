@@ -1,4 +1,2 @@
-aiogram
-httpx
-python-dotenv
-Pillow
+python-telegram-bot==20.7
+requests
