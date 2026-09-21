@@ -1,131 +1,62 @@
-import os
-import logging
-import sqlite3
-import datetime
-from decimal import Decimal
-import requests
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+import os, logging, sqlite3
+from aiogram import Bot, Dispatcher, types
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils import executor
 
-# --- CONFIG ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-FAZERCARDS_API_KEY = os.getenv("FAZERCARDS_API_KEY", "")
-FAZERCARDS_BASE_URL = os.getenv("FAZERCARDS_BASE_URL", "https://api.fazercards.com/v1")
+ADMIN_ID = os.getenv("ADMIN_ID")
 
-CARD_NUMBER = "+992935710406"
-CARD_BANKS = "Эсхата Онлайн 🏦 / ICB Mobile 📱"
-BOT_NAME = "TAJ.DONAT.FF"
-SHOP_NAME = "FF Almaz Shop 💎"
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN ёфт нашуд! Дар Render Environment гузор!")
 
 logging.basicConfig(level=logging.INFO)
+bot = Bot(token=BOT_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(bot, storage=storage)
 
-# --- DATABASE ---
-con = sqlite3.connect("almaz.db", check_same_thread=False)
-cur = con.cursor()
-cur.execute("""CREATE TABLE IF NOT EXISTS users (telegram_id INTEGER UNIQUE, balance TEXT DEFAULT '0')""")
-con.commit()
+# База
+conn = sqlite3.connect("taj_donat.db", check_same_thread=False)
+cur = conn.cursor()
+cur.execute("CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY, user_id INTEGER, username TEXT, diamond TEXT, price TEXT, game_id TEXT)")
+conn.commit()
 
-def get_balance(tid):
-    cur.execute("SELECT balance FROM users WHERE telegram_id=?", (tid,))
-    r = cur.fetchone()
-    return Decimal(r[0]) if r and r[0] else Decimal("0")
+class OrderState(StatesGroup):
+    waiting_id = State()
 
-def check_fazercards_nick(player_id):
-    try:
-        headers = {"Authorization": f"Bearer {FAZERCARDS_API_KEY}", "Content-Type": "application/json"}
-        resp = requests.post(f"{FAZERCARDS_BASE_URL}/check", json={"player_id": player_id, "region": "ME"}, headers=headers, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            return data.get("nickname") or data.get("name") or "Ёфт шуд"
-        return "Санҷида нашуд"
-    except:
-        return "Санҷида нашуд"
+PACKS = {"10":"7 TJS", "50":"35 TJS", "110":"70 TJS", "560":"320 TJS", "1150":"650 TJS"}
 
-def main_menu():
-    return ReplyKeyboardMarkup([["👤 Профил","💎 Хариди Алмаз"],["💰 Баланс","ℹ️ Кӯмак"]], resize_keyboard=True)
+def shop_kb():
+    kb = InlineKeyboardMarkup(row_width=2)
+    for k,v in PACKS.items():
+        kb.add(InlineKeyboardButton(f"{k} 💎 - {v}", callback_data=f"buy_{k}"))
+    return kb
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"Салом! 💎\nБот: @{BOT_NAME}\n\n💳 {CARD_NUMBER}\n🏦 {CARD_BANKS}\n\nID-и худро барои хариди автоматӣ равон кн!", reply_markup=main_menu())
+@dp.message_handler(commands=['start'])
+async def start(m: types.Message):
+    await m.answer(f"Салом {m.from_user.first_name}! 🇹🇯\n\nБа TAJ DONAT хуш омадед!\n💎 Арзонтарин алмазҳо:\n\n10💎 - 7 TJS\n50💎 - 35 TJS\n110💎 - 70 TJS\n560💎 - 320 TJS\n1150💎 - 650 TJS\n\n👇 Интихоб кн:", reply_markup=shop_kb())
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text == "💎 Хариди Алмаз":
-        context.user_data["step"] = "ask_id"
-        await update.message.reply_text("🆔 ID-и Free Fire-и худро равон кн:")
-    elif text == "💰 Баланс":
-        await update.message.reply_text(f"💰 Баланс: {get_balance(update.effective_user.id)} сом")
-    elif context.user_data.get("step") == "ask_id" and text.isdigit():
-        player_id = text
-        context.user_data["player_id"] = player_id
-        await update.message.reply_text(f"⏳ ID {player_id} санҷида истодааст...")
-        nickname = check_fazercards_nick(player_id)
-        context.user_data["nickname"] = nickname
-        kb = [[InlineKeyboardButton("100 💎 - 12.34 сом", callback_data="buy_100")],
-              [InlineKeyboardButton("310 💎 - 35 сом", callback_data="buy_310")],
-              [InlineKeyboardButton("520 💎 - 60 сом", callback_data="buy_520")],
-              [InlineKeyboardButton("1060 💎 - 115 сом", callback_data="buy_1060")]]
-        await update.message.reply_text(f"✅ ID: {player_id}\n👤 Ник: {nickname}\n🌍 ME\nИнтихоб кн:", reply_markup=InlineKeyboardMarkup(kb))
+@dp.callback_query_handler(lambda c: c.data.startswith('buy_'))
+async def buy(call: types.CallbackQuery, state: FSMContext):
+    pack = call.data.split("_")[1]
+    await state.update_data(pack=pack, price=PACKS[pack])
+    await call.message.answer(f"Шумо {pack} алмаз интихоб кардед\n🎮 ID-и Free Fire-ро нависед:")
+    await OrderState.waiting_id.set()
+    await call.answer()
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data.startswith("buy_"):
-        diamonds = query.data.split("_")[1]
-        prices = {"100": "12.34", "310": "35", "520": "60", "1060": "115"}
-        price = prices.get(diamonds, "0")
-        player_id = context.user_data.get("player_id", "???")
-        nickname = context.user_data.get("nickname", "???")
-
-        await query.message.reply_text(f"⏳ {diamonds} 💎 барои {player_id} ({nickname}) аз Fazercards фиристода истодааст...")
-
-        # === АВТОМАТ АЗ FAZERCARDS ===
-        ok = False
-        resp_text = ""
+@dp.message_handler(state=OrderState.waiting_id)
+async def get_id(m: types.Message, state: FSMContext):
+    data = await state.get_data()
+    cur.execute("INSERT INTO orders (user_id, username, diamond, price, game_id) VALUES (?,?,?,?,?)", (m.from_user.id, m.from_user.username, data['pack'], data['price'], m.text))
+    conn.commit()
+    await m.answer(f"✅ Қабул шуд! {data['pack']} 💎 - ID: {m.text}\n💳 DC: 992... чекро фирист!")
+    if ADMIN_ID:
         try:
-            headers = {"Authorization": f"Bearer {FAZERCARDS_API_KEY}", "Content-Type": "application/json"}
-            payload = {"player_id": player_id, "diamonds": int(diamonds), "region": "ME", "external_id": f"{query.from_user.id}_{player_id}_{diamonds}"}
-            r = requests.post(f"{FAZERCARDS_BASE_URL}/order", json=payload, headers=headers, timeout=20)
-            resp_text = r.text
-            ok = r.status_code == 200
-            logging.info(f"Fazercards order {r.status_code}: {resp_text}")
-        except Exception as e:
-            resp_text = str(e)
-            logging.error(f"Auto order error: {e}")
+            await bot.send_message(int(ADMIN_ID), f"🔥 Фармоиш: {data['pack']} 💎 | ID: {m.text} | @{m.from_user.username}")
+        except: pass
+    await state.finish()
 
-        now = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
-        if ok:
-            status = "✅ АЛМАЗ АЗ FAZERCARDS ФИРИСТОДА ШУД! 1-5 дақ меояд!"
-        else:
-            status = "⏳ Заказ қабул шуд! Админ дастӣ мефиристад"
-
-        receipt = f"""🧾 ЧЕК - {SHOP_NAME}
-🤖 @{BOT_NAME}
-{status}
-
-🆔 ID: {player_id}
-👤 Ник: {nickname}
-💎 Алмаз: {diamonds}
-💰 Нарх: {price} сом
-
-💳 Пардохт: {CARD_NUMBER}
-🏦 {CARD_BANKS}
-📅 {now}
-"""
-        await query.message.reply_text(receipt)
-
-        if ADMIN_ID:
-            try:
-                await context.bot.send_message(ADMIN_ID, f"🔔 ЗАКАЗИ АВТОМАТ\n{receipt}\n\nFazercards javob: {resp_text[:1000]}")
-            except: pass
-
-def main():
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("Bot started...")
-    app.run_polling()
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    executor.start_polling(dp, skip_updates=True)
